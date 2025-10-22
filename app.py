@@ -24,6 +24,25 @@ driver = GraphDatabase.driver(URI, auth=(USER, PASS))
 
 app = FastAPI()
 
+# Define the origins that are allowed to access your API
+# Replace "http://localhost:3000" with the actual URL of your client app
+origins = [
+    # Allow your local development server
+    "http://localhost:8080",
+    # Allow a specific production client URL (if applicable)
+    "https://your-client-app-domain.com",
+    # Optional: You can allow all origins in development (NOT RECOMMENDED FOR PRODUCTION)
+    # "*",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,              # List of allowed origins
+    allow_credentials=True,             # Allow cookies/authorization headers to be passed
+    allow_methods=["*"],                # Allow all methods (GET, POST, etc.)
+    allow_headers=["*", "Authorization"], # Allow all headers, explicitly including Authorization
+)
+
 class Stmt(BaseModel):
     statement: str
     parameters: dict | None = None
