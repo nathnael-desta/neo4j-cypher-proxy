@@ -1,7 +1,9 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 from neo4j.exceptions import SessionExpired, ServiceUnavailable
+from typing import Optional, List
 import os
 
 API_TOKEN = os.getenv("API_TOKEN")
