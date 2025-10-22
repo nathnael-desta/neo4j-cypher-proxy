@@ -6,6 +6,7 @@ from neo4j.exceptions import SessionExpired, ServiceUnavailable
 from typing import Optional, List
 from dotenv import load_dotenv
 import os
+import httpx
 
 if os.getenv("RENDER") is None:
     # This block runs ONLY on your local machine
@@ -49,6 +50,14 @@ class Stmt(BaseModel):
 
 class CypherBody(BaseModel):
     statements: list[Stmt]
+
+class Recommendation(BaseModel):
+    trackId: str
+    score: float
+
+class RecommendationResponse(BaseModel):
+    recommendations: List[Recommendation]
+    source: str
 
 @app.get("/")
 def health():
@@ -153,3 +162,109 @@ def track_detail(
     if not rows:
         raise HTTPException(status_code=404, detail="Track not found")
     return TrackDetail(**rows[0]).model_dump()
+
+
+TRACK_RECOMMENDATION_CYPHER = """
+WITH $trackId AS tid, toInteger($k) AS k
+
+// RecIndex list (may be empty)
+OPTIONAL MATCH (idx:RecIndex {pid: tid})
+WITH tid, k, idx,
+            CASE WHEN idx IS NOT NULL
+                 THEN [i IN range(0, size(idx.recIds)-1) |
+                         {trackId: idx.recIds[i], score: idx.scores[i]}]
+                 ELSE []
+            END AS idxList
+
+// Undirected co-occurrence edges, dedup by neighbor with max popularity
+OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track)
+WHERE rec.trackId <> tid
+WITH tid, k, idxList, rec, r
+WITH tid, k, idxList, rec.trackId AS rid, max(r.popularity) AS pop
+ORDER BY pop DESC
+WITH tid, k, idxList, collect({trackId: rid, score: pop}) AS edgeList
+
+// Album siblings as last resort
+OPTIONAL MATCH (t:Track {trackId: tid})-[:BelongsTo]->(alb:Category)<-[:BelongsTo]-(albRec:Track)
+WHERE albRec.trackId <> tid
+WITH k, idxList, edgeList, collect({trackId: albRec.trackId, score: 0.5}) AS albumList
+
+// Start with RecIndex if present, else edges
+WITH k, idxList, edgeList, albumList,
+            CASE WHEN size(idxList) > 0 THEN idxList ELSE edgeList END AS baseList
+
+// Fill from edges then album until we reach K
+WITH k, baseList, [x IN baseList | x.trackId] AS have, edgeList, albumList, idxList
+WITH k, baseList + [e IN edgeList WHERE NOT e.trackId IN have] AS basePlusEdges, idxList, edgeList, albumList
+WITH k, basePlusEdges, [x IN basePlusEdges | x.trackId] AS have2, idxList, edgeList, albumList
+WITH k, basePlusEdges + [a IN albumList WHERE NOT a.trackId IN have2] AS combined, idxList, edgeList
+
+RETURN combined[..k] AS recommendations,
+              CASE WHEN size(idxList) > 0 THEN 'recindex+fill'
+                   WHEN size(edgeList) > 0 THEN 'edges'
+                   ELSE 'album' END AS source
+"""
+
+@app.get("/tracks/{track_id}/recommendations", response_model=RecommendationResponse)
+async def get_track_recommendations(
+    track_id: str,
+    k: int = Query(8, ge=1, le=50, alias="k", description="Number of recommendations"),
+    _=Depends(require_auth)
+):
+    """
+    Fetches track recommendations for a given trackId using the multi-stage Cypher logic.
+    """
+
+    # 1. Construct the CypherBody required by the /cypher endpoint
+    body = CypherBody(
+        statements=[
+            Stmt(
+                statement=TRACK_RECOMMENDATION_CYPHER,
+                parameters={"trackId": track_id, "k": k}
+            )
+        ]
+    )
+
+    # 2. Determine the full URL for the internal request to /cypher
+    # On Render, the service URL is neo4j-cypher-proxy.onrender.com, but it's often easier
+    # to access the endpoint locally if running uvicorn or by using the full URL.
+    # We'll use the full URL to ensure it works on Render and locally if configured.
+    cypher_url = "https://neo4j-cypher-proxy.onrender.com/cypher"
+
+    # 3. Make the internal HTTP request to the /cypher endpoint
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    # Use httpx to make the async request (assuming you install it: pip install httpx)
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(cypher_url, json=body.model_dump(), headers=headers)
+            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        except httpx.HTTPStatusError as e:
+            # Handle specific upstream errors, e.g., if /cypher returns 401/403
+            if e.response.status_code in (401, 403):
+                 raise HTTPException(status_code=403, detail="Authorization failed for internal request.")
+            raise HTTPException(status_code=500, detail=f"Internal Cypher query failed: {e}")
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to connect to internal Cypher endpoint: {e}")
+
+    # 4. Process the response from /cypher
+    try:
+        results = response.json().get("results", [])
+        if not results or not results[0]:
+            # This indicates the Cypher query returned no results, which is unexpected
+            # but we'll return an empty list of recommendations.
+            return RecommendationResponse(recommendations=[], source='none')
+
+        # The result structure is: {"results": [[{recommendations: [...], source: "..."}]]}
+        first_result = results[0][0]
+
+        return RecommendationResponse(
+            recommendations=first_result.get("recommendations", []),
+            source=first_result.get("source", "unknown")
+        )
+
+    except (KeyError, IndexError, TypeError) as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse Cypher results: {e}")
