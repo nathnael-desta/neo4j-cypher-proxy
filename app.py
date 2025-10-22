@@ -163,58 +163,71 @@ def track_detail(
         raise HTTPException(status_code=404, detail="Track not found")
     return TrackDetail(**rows[0]).model_dump()
 
+DECAY_RATE = 0.98
 
 TRACK_RECOMMENDATION_CYPHER = """
-WITH $trackId AS tid, toInteger($k) AS k
+WITH $trackId AS tid, toInteger($k) AS k, toFloat($decay) AS d
 
-// RecIndex list (may be empty)
+// --- RecIndex (decayed by joining the real edge for last_seen)
 OPTIONAL MATCH (idx:RecIndex {pid: tid})
-WITH tid, k, idx,
-            CASE WHEN idx IS NOT NULL
-                 THEN [i IN range(0, size(idx.recIds)-1) |
-                         {trackId: idx.recIds[i], score: idx.scores[i]}]
-                 ELSE []
-            END AS idxList
+WITH tid, k, d, idx,
+     CASE WHEN idx IS NULL THEN [] ELSE idx.recIds END AS ids
+UNWIND ids AS rid
+OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track {trackId: rid})
+WITH tid, k, d, rid,
+     coalesce(r.popularity, 0) AS pop,
+     coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0) AS ageDays
+WITH tid, k, d,
+     [x IN collect({rid: rid, score: round(pop * pow(d, ageDays), 3)})
+        WHERE x.score > 0] AS idxList
 
-// Undirected co-occurrence edges, dedup by neighbor with max popularity
+// --- Live edge list (decayed)
 OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track)
 WHERE rec.trackId <> tid
-WITH tid, k, idxList, rec, r
-WITH tid, k, idxList, rec.trackId AS rid, max(r.popularity) AS pop
-ORDER BY pop DESC
-WITH tid, k, idxList, collect({trackId: rid, score: pop}) AS edgeList
+WITH tid, k, d, idxList, rec, r,
+     coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0) AS ageDays
+WITH tid, k, idxList,
+     rec.trackId AS rid,
+     round(max(r.popularity * pow(d, ageDays)), 3) AS score
+ORDER BY score DESC
+WITH tid, k, idxList,
+     [x IN collect({trackId: rid, score: score}) WHERE x.score > 0] AS edgeList
 
-// Album siblings as last resort
+// --- Album fallback
 OPTIONAL MATCH (t:Track {trackId: tid})-[:BelongsTo]->(alb:Category)<-[:BelongsTo]-(albRec:Track)
 WHERE albRec.trackId <> tid
 WITH k, idxList, edgeList, collect({trackId: albRec.trackId, score: 0.5}) AS albumList
 
-// Start with RecIndex if present, else edges
+// --- Choose base & fill to K
 WITH k, idxList, edgeList, albumList,
-            CASE WHEN size(idxList) > 0 THEN idxList ELSE edgeList END AS baseList
+     CASE WHEN size(idxList) > 0 THEN 'recindex+decay'
+          WHEN size(edgeList) > 0 THEN 'edges+decay'
+          ELSE 'album' END AS source
 
-// Fill from edges then album until we reach K
-WITH k, baseList, [x IN baseList | x.trackId] AS have, edgeList, albumList, idxList
-WITH k, baseList + [e IN edgeList WHERE NOT e.trackId IN have] AS basePlusEdges, idxList, edgeList, albumList
-WITH k, basePlusEdges, [x IN basePlusEdges | x.trackId] AS have2, idxList, edgeList, albumList
-WITH k, basePlusEdges + [a IN albumList WHERE NOT a.trackId IN have2] AS combined, idxList, edgeList
+WITH k, source,
+     CASE WHEN source STARTS WITH 'recindex' THEN
+          // project idxList into uniform shape
+          [ {trackId: x.rid, score: x.score} IN idxList ]
+     ELSE edgeList END AS baseList,
+     edgeList, albumList
 
-RETURN combined[..k] AS recommendations,
-              CASE WHEN size(idxList) > 0 THEN 'recindex+fill'
-                   WHEN size(edgeList) > 0 THEN 'edges'
-                   ELSE 'album' END AS source
+WITH k, source, baseList, edgeList, [x IN baseList | x.trackId] AS have
+WITH k, source,
+     baseList + [e IN edgeList WHERE NOT e.trackId IN have] AS basePlusEdges,
+     albumList
+
+WITH k, source, basePlusEdges, [x IN basePlusEdges | x.trackId] AS have2, albumList
+RETURN (basePlusEdges + [a IN albumList WHERE NOT a.trackId IN have2])[..k] AS recommendations,
+       source
 """
+
 
 @app.get("/tracks/{track_id}/recommendations", response_model=RecommendationResponse)
 async def get_track_recommendations(
     track_id: str,
-    k: int = Query(8, ge=1, le=50, alias="k", description="Number of recommendations"),
+    k: int = Query(8, ge=1, le=50, alias="k"),
     _=Depends(require_auth)
 ):
-    """
-    Fetches track recommendations for a given trackId using the multi-stage Cypher logic.
-    """
-    # Check if track exists first to provide clearer error
     rows = run_query("MATCH (t:Track {trackId:$tid}) RETURN t", {"tid": track_id})
     if not rows:
         raise HTTPException(status_code=404, detail="Track not found")
@@ -223,36 +236,25 @@ async def get_track_recommendations(
         statements=[
             Stmt(
                 statement=TRACK_RECOMMENDATION_CYPHER,
-                parameters={"trackId": track_id, "k": k}
+                parameters={"trackId": track_id, "k": k, "decay": DECAY_RATE}
             )
         ]
     )
+
     cypher_url = "https://neo4j-cypher-proxy.onrender.com/cypher"
     headers = {
         "Authorization": f"Bearer {API_TOKEN}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(cypher_url, json=body.model_dump(), headers=headers)
-            print(f"Internal /cypher response: {response.status_code} {response.text}")  # Debug log
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            print(f"Internal /cypher error: {e.response.status_code} {e.response.text}")  # Debug log
-            raise HTTPException(status_code=500, detail=f"Internal Cypher query failed: {e}")
-        except httpx.RequestError as e:
-            print(f"Internal /cypher connection error: {e}")  # Debug log
-            raise HTTPException(status_code=500, detail=f"Failed to connect to internal Cypher endpoint: {e}")
+        resp = await client.post(cypher_url, json=body.model_dump(), headers=headers)
+        resp.raise_for_status()
 
-    try:
-        results = response.json().get("results", [])
-        if not results or not results[0]:
-            return RecommendationResponse(recommendations=[], source="none")
-        first_result = results[0][0]
-        return RecommendationResponse(
-            recommendations=first_result.get("recommendations", []),
-            source=first_result.get("source", "unknown")
-        )
-    except (KeyError, IndexError, TypeError) as e:
-        print(f"Response parsing error: {e}")  # Debug log
-        raise HTTPException(status_code=500, detail=f"Failed to parse Cypher results: {e}")
+    results = resp.json().get("results", [])
+    if not results or not results[0]:
+        return RecommendationResponse(recommendations=[], source="none")
+    first = results[0][0]
+    return RecommendationResponse(
+        recommendations=first.get("recommendations", []),
+        source=first.get("source", "unknown")
+    )
