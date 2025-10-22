@@ -214,8 +214,11 @@ async def get_track_recommendations(
     """
     Fetches track recommendations for a given trackId using the multi-stage Cypher logic.
     """
+    # Check if track exists first to provide clearer error
+    rows = run_query("MATCH (t:Track {trackId:$tid}) RETURN t", {"tid": track_id})
+    if not rows:
+        raise HTTPException(status_code=404, detail="Track not found")
 
-    # 1. Construct the CypherBody required by the /cypher endpoint
     body = CypherBody(
         statements=[
             Stmt(
@@ -224,47 +227,32 @@ async def get_track_recommendations(
             )
         ]
     )
-
-    # 2. Determine the full URL for the internal request to /cypher
-    # On Render, the service URL is neo4j-cypher-proxy.onrender.com, but it's often easier
-    # to access the endpoint locally if running uvicorn or by using the full URL.
-    # We'll use the full URL to ensure it works on Render and locally if configured.
     cypher_url = "https://neo4j-cypher-proxy.onrender.com/cypher"
-
-    # 3. Make the internal HTTP request to the /cypher endpoint
     headers = {
         "Authorization": f"Bearer {API_TOKEN}",
         "Content-Type": "application/json",
     }
-
-    # Use httpx to make the async request (assuming you install it: pip install httpx)
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(cypher_url, json=body.model_dump(), headers=headers)
-            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+            print(f"Internal /cypher response: {response.status_code} {response.text}")  # Debug log
+            response.raise_for_status()
         except httpx.HTTPStatusError as e:
-            # Handle specific upstream errors, e.g., if /cypher returns 401/403
-            if e.response.status_code in (401, 403):
-                 raise HTTPException(status_code=403, detail="Authorization failed for internal request.")
+            print(f"Internal /cypher error: {e.response.status_code} {e.response.text}")  # Debug log
             raise HTTPException(status_code=500, detail=f"Internal Cypher query failed: {e}")
         except httpx.RequestError as e:
+            print(f"Internal /cypher connection error: {e}")  # Debug log
             raise HTTPException(status_code=500, detail=f"Failed to connect to internal Cypher endpoint: {e}")
 
-    # 4. Process the response from /cypher
     try:
         results = response.json().get("results", [])
         if not results or not results[0]:
-            # This indicates the Cypher query returned no results, which is unexpected
-            # but we'll return an empty list of recommendations.
-            return RecommendationResponse(recommendations=[], source='none')
-
-        # The result structure is: {"results": [[{recommendations: [...], source: "..."}]]}
+            return RecommendationResponse(recommendations=[], source="none")
         first_result = results[0][0]
-
         return RecommendationResponse(
             recommendations=first_result.get("recommendations", []),
             source=first_result.get("source", "unknown")
         )
-
     except (KeyError, IndexError, TypeError) as e:
+        print(f"Response parsing error: {e}")  # Debug log
         raise HTTPException(status_code=500, detail=f"Failed to parse Cypher results: {e}")
