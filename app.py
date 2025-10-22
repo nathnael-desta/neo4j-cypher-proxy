@@ -4,13 +4,21 @@ from pydantic import BaseModel
 from neo4j import GraphDatabase
 from neo4j.exceptions import SessionExpired, ServiceUnavailable
 from typing import Optional, List
+from dotenv import load_dotenv
 import os
+
+if os.getenv("RENDER") is None:
+    # This block runs ONLY on your local machine
+    print("Loading .env file for local development...") # Optional: good for debugging
+    load_dotenv()
 
 API_TOKEN = os.getenv("API_TOKEN")
 URI = os.getenv("NEO4J_URI")
 USER = os.getenv("NEO4J_USER")
 PASS = os.getenv("NEO4J_PASS")
 API_TOKEN  = os.getenv("API_TOKEN")
+NEO4J_DB = os.getenv("NEO4J_DB", "neo4j")
+
 
 driver = GraphDatabase.driver(URI, auth=(USER, PASS))
 
