@@ -168,57 +168,55 @@ DECAY_RATE = 0.98
 TRACK_RECOMMENDATION_CYPHER = """
 WITH $trackId AS tid, toInteger($k) AS k, toFloat($decay) AS d
 
-// --- RecIndex (decayed by joining the real edge for last_seen)
-OPTIONAL MATCH (idx:RecIndex {pid: tid})
-WITH tid, k, d, idx,
-     CASE WHEN idx IS NULL THEN [] ELSE idx.recIds END AS ids
-UNWIND ids AS rid
-OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track {trackId: rid})
-WITH tid, k, d, rid,
-     coalesce(r.popularity, 0) AS pop,
-     coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0) AS ageDays
-WITH tid, k, d,
-     [x IN collect({rid: rid, score: round(pop * pow(d, ageDays), 3)})
-        WHERE x.score > 0] AS idxList
+// ---------- Subquery: decayed RecIndex (robust when idx missing)
+CALL {
+  WITH tid, d
+  OPTIONAL MATCH (idx:RecIndex {pid: tid})
+  WITH tid, d, CASE WHEN idx IS NULL THEN [] ELSE idx.recIds END AS ids
+  UNWIND ids AS rid
+  OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track {trackId: rid})
+  WITH d, rid,
+       coalesce(r.popularity, 0) AS pop,
+       coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0) AS ageDays
+  WITH collect({
+    rid: rid,
+    score: round(pop * pow(d, ageDays), 3)
+  }) AS rows
+  RETURN [x IN rows WHERE x.score > 0] AS idxList
+}
 
-// --- Live edge list (decayed)
-OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track)
-WHERE rec.trackId <> tid
-WITH tid, k, d, idxList, rec, r,
-     coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0) AS ageDays
-WITH tid, k, idxList,
-     rec.trackId AS rid,
-     round(max(r.popularity * pow(d, ageDays)), 3) AS score
-ORDER BY score DESC
-WITH tid, k, idxList,
-     [x IN collect({trackId: rid, score: score}) WHERE x.score > 0] AS edgeList
+// ---------- Subquery: decayed co-occurrence edges
+CALL {
+  WITH tid, d
+  OPTIONAL MATCH (:Track {trackId: tid})-[r:InSameSession]-(rec:Track)
+  WHERE rec.trackId <> tid
+  WITH rec.trackId AS rid,
+       max(r.popularity) AS pop,
+       max(coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0)) AS ageDays,
+       d
+  WITH rid, round(pop * pow(d, ageDays), 3) AS score
+  ORDER BY score DESC
+  RETURN [x IN collect({trackId: rid, score: score}) WHERE x.score > 0] AS edgeList
+}
 
-// --- Album fallback
+// ---------- Album fallback
 OPTIONAL MATCH (t:Track {trackId: tid})-[:BelongsTo]->(alb:Category)<-[:BelongsTo]-(albRec:Track)
 WHERE albRec.trackId <> tid
 WITH k, idxList, edgeList, collect({trackId: albRec.trackId, score: 0.5}) AS albumList
 
-// --- Choose base & fill to K
+// ---------- Choose base and fill to K
 WITH k, idxList, edgeList, albumList,
      CASE WHEN size(idxList) > 0 THEN 'recindex+decay'
           WHEN size(edgeList) > 0 THEN 'edges+decay'
-          ELSE 'album' END AS source
+          ELSE 'album' END AS source,
+     CASE WHEN size(idxList) > 0
+          THEN [x IN idxList | {trackId: x.rid, score: x.score}]
+          ELSE edgeList END AS baseList
 
-WITH k, source,
-     CASE WHEN source STARTS WITH 'recindex' THEN
-          // project idxList into uniform shape
-          [ {trackId: x.rid, score: x.score} IN idxList ]
-     ELSE edgeList END AS baseList,
-     edgeList, albumList
-
-WITH k, source, baseList, edgeList, [x IN baseList | x.trackId] AS have
-WITH k, source,
-     baseList + [e IN edgeList WHERE NOT e.trackId IN have] AS basePlusEdges,
-     albumList
-
-WITH k, source, basePlusEdges, [x IN basePlusEdges | x.trackId] AS have2, albumList
-RETURN (basePlusEdges + [a IN albumList WHERE NOT a.trackId IN have2])[..k] AS recommendations,
-       source
+WITH k, source, baseList, edgeList, albumList, [x IN baseList | x.trackId] AS have
+WITH k, source, baseList + [e IN edgeList WHERE NOT e.trackId IN have] AS b2, albumList
+WITH k, source, b2, [x IN b2 | x.trackId] AS have2, albumList
+RETURN (b2 + [a IN albumList WHERE NOT a.trackId IN have2])[..k] AS recommendations, source
 """
 
 
