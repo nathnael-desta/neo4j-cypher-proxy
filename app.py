@@ -168,7 +168,7 @@ DECAY_RATE = 0.98
 TRACK_RECOMMENDATION_CYPHER = """
 WITH $trackId AS tid, toInteger($k) AS k, toFloat($decay) AS d
 
-// ---------- Subquery: decayed RecIndex (robust when idx missing)
+// ---------- Subquery: decayed RecIndex (safe if idx missing)
 CALL {
   WITH tid, d
   OPTIONAL MATCH (idx:RecIndex {pid: tid})
@@ -180,7 +180,8 @@ CALL {
        coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0) AS ageDays
   WITH collect({
     rid: rid,
-    score: round(pop * pow(d, ageDays), 3)
+    // use exponent operator ^ instead of pow()
+    score: round(pop * (d ^ ageDays), 3)
   }) AS rows
   RETURN [x IN rows WHERE x.score > 0] AS idxList
 }
@@ -194,7 +195,7 @@ CALL {
        max(r.popularity) AS pop,
        max(coalesce(duration.between(datetime({epochMillis:r.last_seen}), datetime()).days, 0)) AS ageDays,
        d
-  WITH rid, round(pop * pow(d, ageDays), 3) AS score
+  WITH rid, round(pop * (d ^ ageDays), 3) AS score
   ORDER BY score DESC
   RETURN [x IN collect({trackId: rid, score: score}) WHERE x.score > 0] AS edgeList
 }
@@ -218,6 +219,7 @@ WITH k, source, baseList + [e IN edgeList WHERE NOT e.trackId IN have] AS b2, al
 WITH k, source, b2, [x IN b2 | x.trackId] AS have2, albumList
 RETURN (b2 + [a IN albumList WHERE NOT a.trackId IN have2])[..k] AS recommendations, source
 """
+
 
 
 @app.get("/tracks/{track_id}/recommendations", response_model=RecommendationResponse)
