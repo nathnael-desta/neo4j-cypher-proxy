@@ -7,6 +7,13 @@ from typing import Optional, List, Dict
 from dotenv import load_dotenv
 import os
 import httpx
+import logging
+
+# ---------------------------
+# Logging
+# ---------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ---------------------------
 # Boot + ENV
@@ -38,6 +45,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*", "Authorization"],
 )
+
+# Log on startup
+logger.info("🚀 FastAPI server started. Routes loaded. Neo4j DB=%s | GeminiModel=%s | GeminiKey=%s",
+            NEO4J_DB, GEMINI_MODEL, "SET" if GEMINI_API_KEY else "MISSING")
 
 # ---------------------------
 # Models
@@ -83,6 +94,7 @@ class SearchResponse(BaseModel):
 # ---------------------------
 @app.get("/")
 def health():
+    logger.info("💓 Health check hit")
     return {"ok": True}
 
 def run_statements(statements: list[Stmt]):
@@ -97,10 +109,13 @@ def run_statements(statements: list[Stmt]):
 @app.post("/cypher")
 def cypher(body: CypherBody, authorization: str = Header(default="")):
     if not API_TOKEN or authorization != f"Bearer {API_TOKEN}":
+        logger.warning("🔐 /cypher unauthorized attempt")
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
+        logger.info("🧠 /cypher executing %d statement(s)", len(body.statements))
         return {"results": run_statements(body.statements)}
-    except (SessionExpired, ServiceUnavailable, OSError):
+    except (SessionExpired, ServiceUnavailable, OSError) as e:
+        logger.warning("♻️  /cypher retry after exception: %s", e)
         return {"results": run_statements(body.statements)}
 
 def require_auth(authorization: Optional[str] = Header(None, alias="Authorization")):
@@ -173,6 +188,7 @@ def tracks_search(
     _=Depends(require_auth)
 ):
     rows = run_query(TRACK_SEARCH, {"q": q, "limit": limit})
+    logger.info("🔎 Search q='%s' -> %d rows", q, len(rows))
     return {"results": [TrackLite(**r).model_dump() for r in rows]}
 
 @app.get("/tracks/{track_id}", response_model=TrackDetail)
@@ -182,7 +198,9 @@ def track_detail(
 ):
     rows = run_query(TRACK_META, {"tid": track_id})
     if not rows:
+        logger.info("❌ Track not found: %s", track_id)
         raise HTTPException(status_code=404, detail="Track not found")
+    logger.info("ℹ️ Track detail fetched: %s", track_id)
     return TrackDetail(**rows[0]).model_dump()
 
 # ---------------------------
@@ -256,6 +274,7 @@ async def llm_explain_recs(
     Returns None on any error or if GEMINI_API_KEY is absent.
     """
     if not GEMINI_API_KEY:
+        logger.warning("🟡 Gemini skipped — GEMINI_API_KEY missing")
         return None
 
     # Keep it brief: top 5 for the prompt
@@ -295,19 +314,23 @@ async def llm_explain_recs(
     }
 
     try:
+        logger.info("💬 Calling Gemini model=%s", GEMINI_MODEL)
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.post(url, json=payload)
             r.raise_for_status()
             data = r.json()
             # Best-effort extract
-            return (
+            text = (
                 data.get("candidates", [{}])[0]
                     .get("content", {})
                     .get("parts", [{}])[0]
                     .get("text", "")
                     .strip()
-            ) or None
-    except Exception:
+            )
+            logger.info("✅ Gemini response received (%d chars)", len(text))
+            return text or None
+    except Exception as e:
+        logger.error("🔴 Gemini request failed: %s - %s", type(e).__name__, e)
         return None
 
 # ---------------------------
@@ -319,9 +342,12 @@ async def get_track_recommendations(
     k: int = Query(8, ge=1, le=50, alias="k"),
     _=Depends(require_auth)
 ):
+    logger.info("🎧 Recs request | track_id=%s | k=%d", track_id, k)
+
     # Seed exists?
     rows = run_query("MATCH (t:Track {trackId:$tid}) RETURN t", {"tid": track_id})
     if not rows:
+        logger.info("❌ Track not found for recs: %s", track_id)
         raise HTTPException(status_code=404, detail="Track not found")
 
     # Run recs via internal /cypher (same as before)
@@ -340,21 +366,23 @@ async def get_track_recommendations(
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=15) as client:
+        logger.info("➡️  Posting to cypher proxy: %s", cypher_url)
         resp = await client.post(cypher_url, json=body.model_dump(), headers=headers)
         resp.raise_for_status()
 
     results = resp.json().get("results", [])
     if not results or not results[0]:
+        logger.info("⚠️  Empty recs result for %s", track_id)
         return RecommendationResponseV2(recommendations=[], source="none", explanation=None)
 
     first = results[0][0]
     recs = first.get("recommendations", [])
     source = first.get("source", "unknown")
+    logger.info("✅ Recs computed | count=%d | source=%s", len(recs), source)
 
     # ---- LLM explanation (non-blocking on failure) ----
     explanation = None
     try:
-        # Get seed + top rec metadata for a nicer prompt
         seed_meta = run_query(TRACK_META, {"tid": track_id})
         seed_info = seed_meta[0] if seed_meta else {"trackId": track_id, "name": track_id}
 
@@ -362,7 +390,6 @@ async def get_track_recommendations(
         rec_meta_rows = run_query(TRACK_META_MANY, {"tids": rec_ids})
         meta_by_id = _by_id(rec_meta_rows)
 
-        # Merge score into meta for prompt
         enriched = []
         for r in recs[:5]:
             meta = dict(meta_by_id.get(r["trackId"], {"trackId": r["trackId"], "name": r["trackId"]}))
@@ -370,7 +397,8 @@ async def get_track_recommendations(
             enriched.append(meta)
 
         explanation = await llm_explain_recs(seed_info, enriched, source)
-    except Exception:
+    except Exception as e:
+        logger.error("🔴 Explanation step failed but continuing: %s - %s", type(e).__name__, e)
         explanation = None  # never break the main response
 
     return RecommendationResponseV2(
