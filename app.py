@@ -89,6 +89,27 @@ class TrackDetail(BaseModel):
 class SearchResponse(BaseModel):
     results: List[TrackLite]
 
+# ---- ADDED: system health snapshot model ----
+class HealthSnapshot(BaseModel):
+    total_tracks: int
+    cooccur_edges: int
+    cov_total: int
+    cov_ge5: int
+    coverage_ge5_pct: float
+    edges_24h: int
+    recindex_days_ago: Optional[int] = None
+    train_sessions: int
+    test_sessions: int
+
+# ---- ADDED: co-occur edges model ----
+class CooccurEdge(BaseModel):
+    A: str
+    B: str
+    pop: int
+
+class CooccurResponse(BaseModel):
+    edges: List[CooccurEdge]
+
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -179,6 +200,75 @@ RETURN
   art.name   AS artist,
   alb.name   AS album
 ORDER BY name
+"""
+
+# ---- ADDED: system health snapshot cypher ----
+HEALTH_SNAPSHOT_CYPHER = """
+// System health snapshot
+CALL {
+  MATCH (t:Track)
+  RETURN count(t) AS total_tracks
+}
+CALL {
+  // undirected co-occur edges
+  MATCH ()-[r:InSameSession]-()
+  RETURN count(r) AS cooccur_edges
+}
+CALL {
+  // coverage: % of tracks with >= 5 co-occur neighbors
+  MATCH (t:Track)
+  OPTIONAL MATCH (t)-[r:InSameSession]-(:Track)
+  WITH t, count(r) AS deg
+  RETURN
+    count(*) AS cov_total,
+    count(CASE WHEN deg >= 5 THEN 1 END) AS cov_ge5
+}
+CALL {
+  // edges touched in last 24h (by last_seen epochMillis)
+  WITH 24*60*60*1000 AS dayMs
+  MATCH ()-[r:InSameSession]-()
+  WHERE r.last_seen IS NOT NULL AND r.last_seen >= datetime().epochMillis - dayMs
+  RETURN count(r) AS edges_24h
+}
+CALL {
+  // "RecIndex Updated": days since most recent RecIndex timestamp,
+  // fallback to most recent co-occur last_seen if RecIndex lacks timestamps
+  OPTIONAL MATCH (idx:RecIndex)
+  WITH max(coalesce(idx.updated, idx.updatedMillis, idx.ts)) AS msIdx
+  OPTIONAL MATCH ()-[r:InSameSession]-()
+  WITH msIdx, max(r.last_seen) AS msEdge
+  WITH coalesce(msIdx, msEdge) AS ms
+  RETURN CASE
+           WHEN ms IS NULL THEN NULL
+           ELSE duration.between(datetime({epochMillis: ms}), datetime()).days
+         END AS recindex_days_ago
+}
+CALL {
+  // session split counts
+  MATCH (s:Session)
+  RETURN
+    sum(CASE WHEN s.split = 'train' THEN 1 ELSE 0 END) AS train_sessions,
+    sum(CASE WHEN s.split = 'test'  THEN 1 ELSE 0 END) AS test_sessions
+}
+RETURN
+  total_tracks,
+  cooccur_edges,
+  cov_total,
+  cov_ge5,
+  toFloat(cov_ge5) / toFloat(cov_total) * 100.0 AS coverage_ge5_pct,
+  edges_24h,
+  recindex_days_ago,
+  train_sessions,
+  test_sessions
+"""
+
+# ---- ADDED: top co-occur edges cypher (from screenshot) ----
+TOP_COOCCUR_EDGES = """
+MATCH (a:Track)-[r:InSameSession]-(b:Track)
+WHERE id(a) < id(b)
+RETURN a.trackId AS A, b.trackId AS B, r.popularity AS pop
+ORDER BY pop DESC
+LIMIT $limit
 """
 
 @app.get("/tracks/search", response_model=SearchResponse)
@@ -406,3 +496,24 @@ async def get_track_recommendations(
         source=source,
         explanation=explanation
     )
+
+# ---- ADDED: /system/health endpoint ----
+@app.get("/system/health", response_model=HealthSnapshot)
+def system_health(_=Depends(require_auth)):
+    logger.info("🩺 System health snapshot requested")
+    rows = run_query(HEALTH_SNAPSHOT_CYPHER, {})
+    if not rows:
+        logger.error("🟥 Health snapshot returned no rows")
+        raise HTTPException(status_code=500, detail="Health snapshot query returned no results")
+    logger.info("✅ Health snapshot OK")
+    return HealthSnapshot(**rows[0]).model_dump()
+
+# ---- ADDED: /analytics/cooccur/top endpoint ----
+@app.get("/analytics/cooccur/top", response_model=CooccurResponse)
+def top_cooccur_edges(
+    limit: int = Query(50, ge=1, le=500),
+    _=Depends(require_auth)
+):
+    logger.info("🧩 Top co-occur edges requested | limit=%d", limit)
+    rows = run_query(TOP_COOCCUR_EDGES, {"limit": limit})
+    return {"edges": [CooccurEdge(**r).model_dump() for r in rows]}
