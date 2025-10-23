@@ -40,6 +40,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:8080",
         "https://your-client-app-domain.com",
+        "https://neo4j-tracks-recs.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -268,7 +269,7 @@ MATCH (a:Track)-[r:InSameSession]-(b:Track)
 WHERE id(a) < id(b)
 RETURN a.trackId AS A, b.trackId AS B, r.popularity AS pop
 ORDER BY pop DESC
-LIMIT $limit
+LIMIT 20
 """
 
 @app.get("/tracks/search", response_model=SearchResponse)
